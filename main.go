@@ -72,7 +72,12 @@ func commandSource(ctx context.Context, query string, ch chan<- *Result) error {
 	}
 	err = cmd.Wait()
 	if err != nil {
-		return fmt.Errorf("wait L sym: %w", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err() // likely `signal: killed` caused by cancelation
+		default:
+			return fmt.Errorf("wait L sym: %w", err)
+		}
 	}
 	return nil
 }
