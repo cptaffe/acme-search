@@ -4,6 +4,7 @@ package fuzzy
 import (
 	"math"
 	"strings"
+	"unicode"
 )
 
 type Score float64
@@ -24,126 +25,6 @@ const (
 	ScoreMatchDot         Score = 0.6
 )
 
-var bonusStates = [3][256]Score{
-	{0},
-	{
-		'/': ScoreMatchSlash,
-		'-': ScoreMatchWord,
-		'_': ScoreMatchWord,
-		' ': ScoreMatchWord,
-		'.': ScoreMatchDot,
-	},
-	{
-		'/': ScoreMatchSlash,
-		'-': ScoreMatchWord,
-		'_': ScoreMatchWord,
-		' ': ScoreMatchWord,
-		'.': ScoreMatchDot,
-
-		// 'a' ... 'z' = ScoreMatchCapital
-		'a': ScoreMatchCapital,
-		'b': ScoreMatchCapital,
-		'c': ScoreMatchCapital,
-		'd': ScoreMatchCapital,
-		'e': ScoreMatchCapital,
-		'f': ScoreMatchCapital,
-		'g': ScoreMatchCapital,
-		'h': ScoreMatchCapital,
-		'i': ScoreMatchCapital,
-		'j': ScoreMatchCapital,
-		'k': ScoreMatchCapital,
-		'l': ScoreMatchCapital,
-		'm': ScoreMatchCapital,
-		'n': ScoreMatchCapital,
-		'o': ScoreMatchCapital,
-		'p': ScoreMatchCapital,
-		'q': ScoreMatchCapital,
-		'r': ScoreMatchCapital,
-		's': ScoreMatchCapital,
-		't': ScoreMatchCapital,
-		'u': ScoreMatchCapital,
-		'v': ScoreMatchCapital,
-		'w': ScoreMatchCapital,
-		'x': ScoreMatchCapital,
-		'y': ScoreMatchCapital,
-		'z': ScoreMatchCapital,
-	},
-}
-
-var bonusIndex = [256]int{
-	// A...Z = 2
-	'A': 2,
-	'B': 2,
-	'C': 2,
-	'D': 2,
-	'E': 2,
-	'F': 2,
-	'G': 2,
-	'H': 2,
-	'I': 2,
-	'J': 2,
-	'K': 2,
-	'L': 2,
-	'M': 2,
-	'N': 2,
-	'O': 2,
-	'P': 2,
-	'Q': 2,
-	'R': 2,
-	'S': 2,
-	'T': 2,
-	'U': 2,
-	'V': 2,
-	'W': 2,
-	'X': 2,
-	'Y': 2,
-	'Z': 2,
-
-	// a z = 1
-	'a': 1,
-	'b': 1,
-	'c': 1,
-	'd': 1,
-	'e': 1,
-	'f': 1,
-	'g': 1,
-	'h': 1,
-	'i': 1,
-	'j': 1,
-	'k': 1,
-	'l': 1,
-	'm': 1,
-	'n': 1,
-	'o': 1,
-	'p': 1,
-	'q': 1,
-	'r': 1,
-	's': 1,
-	't': 1,
-	'u': 1,
-	'v': 1,
-	'w': 1,
-	'x': 1,
-	'y': 1,
-	'z': 1,
-
-	// ['0' ... '9'] = 1
-	'0': 1,
-	'1': 1,
-	'2': 1,
-	'3': 1,
-	'4': 1,
-	'5': 1,
-	'6': 1,
-	'7': 1,
-	'8': 1,
-	'9': 1,
-}
-
-func computeBonus(prev, current rune) Score {
-	return bonusStates[bonusIndex[byte(current)]][byte(prev)]
-}
-
 type match struct {
 	needleLower   string
 	haystackLower string
@@ -151,12 +32,36 @@ type match struct {
 	matchBonus []Score
 }
 
+func bonusAt(curr, prev rune) Score {
+	var score Score
+	if unicode.IsLetter(curr) || unicode.IsDigit(curr) {
+		switch prev {
+		case '/':
+			return ScoreMatchSlash
+		case '-':
+			return ScoreMatchWord
+		case '_':
+			return ScoreMatchWord
+		case ' ':
+			return ScoreMatchWord
+		case '.':
+			return ScoreMatchDot
+		default:
+			if unicode.IsUpper(curr) && unicode.IsLower(prev) {
+				return ScoreMatchCapital
+			}
+			return score
+		}
+	}
+	return score
+}
+
 func precomputeBonus(haystack string) []Score {
 	/* Which positions are beginning of words */
 	matchBonus := make([]Score, len(haystack))
 	prev := '/'
 	for i, r := range haystack {
-		matchBonus[i] = bonusStates[bonusIndex[byte(r)]][byte(prev)]
+		matchBonus[i] = bonusAt(r, prev)
 		prev = r
 	}
 	return matchBonus
