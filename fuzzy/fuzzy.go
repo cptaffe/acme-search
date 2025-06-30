@@ -25,9 +25,10 @@ const (
 	ScoreMatchDot         Score = 0.6
 )
 
-type match struct {
-	needleLower   string
-	haystackLower string
+type matcher struct {
+	// Lowercased
+	needle   string
+	haystack string
 
 	matchBonus []Score
 }
@@ -67,28 +68,28 @@ func precomputeBonus(haystack string) []Score {
 	return matchBonus
 }
 
-func newMatch(needle string, haystack string) *match {
+func newMatcher(needle string, haystack string) *matcher {
 	if len(needle) > len(haystack) {
 		return nil
 	}
 
-	return &match{
-		needleLower:   strings.ToLower(needle),
-		haystackLower: strings.ToLower(haystack),
-		matchBonus:    precomputeBonus(haystack),
+	return &matcher{
+		needle:     strings.ToLower(needle),
+		haystack:   strings.ToLower(haystack),
+		matchBonus: precomputeBonus(haystack),
 	}
 }
 
-func (m *match) matchRow(i int, nr rune, curr_D []Score, curr_M []Score, last_D []Score, last_M []Score) {
+func (m *matcher) matchRow(i int, nr rune, curr_D []Score, curr_M []Score, last_D []Score, last_M []Score) {
 	prevScore := MinScore
 	var gapScore Score
-	if i == len(m.needleLower)-1 {
+	if i == len(m.needle)-1 {
 		gapScore = ScoreGapTrailing
 	} else {
 		gapScore = ScoreGapInner
 	}
 
-	for j, r := range m.haystackLower {
+	for j, r := range m.haystack {
 		if nr == r {
 			score := MinScore
 			if i == 0 {
@@ -112,36 +113,15 @@ func (m *match) matchRow(i int, nr rune, curr_D []Score, curr_M []Score, last_D 
 	}
 }
 
-func Match(needle string, haystack string) Score {
-	if needle == "" {
-		return MinScore
-	}
-
-	m := newMatch(needle, haystack)
-
-	if len(needle) > len(haystack) {
-		/*
-		 * Unreasonably large candidate: return no score
-		 * If it is a valid match it will still be returned, it will
-		 * just be ranked below any reasonably sized candidates
-		 */
-		return MinScore
-	} else if len(needle) == len(haystack) {
-		/* Since this method can only be called with a haystack which
-		 * matches needle. If the lengths of the strings are equal the
-		 * strings themselves must also be equal (ignoring case).
-		 */
-		return MaxScore
-	}
-
+func (m *matcher) Match() Score {
 	/*
 	 * D[][] Stores the best score for this position ending with a match.
 	 * M[][] Stores the best possible score at this position.
 	 */
 	var D, M [2][]Score
 	for i := range 2 {
-		D[i] = make([]Score, len(haystack))
-		M[i] = make([]Score, len(haystack))
+		D[i] = make([]Score, len(m.haystack))
+		M[i] = make([]Score, len(m.haystack))
 	}
 	var (
 		last_D = D[0]
@@ -150,54 +130,34 @@ func Match(needle string, haystack string) Score {
 		curr_M = M[1]
 	)
 
-	for i, r := range m.needleLower {
+	for i, r := range m.needle {
 		m.matchRow(i, r, curr_D, curr_M, last_D, last_M)
 
 		curr_D, last_D = last_D, curr_D
 		curr_M, last_M = last_M, curr_M
 	}
 
-	return last_M[len(haystack)-1]
+	return last_M[len(m.haystack)-1]
 }
 
-func MatchPositions(needle string, haystack string) (Score, []int) {
-	m := newMatch(needle, haystack)
-	positions := make([]int, len(needle))
-
-	if len(needle) > len(haystack) {
-		/*
-		 * Unreasonably large candidate: return no score
-		 * If it is a valid match it will still be returned, it will
-		 * just be ranked below any reasonably sized candidates
-		 */
-		return MinScore, nil
-	} else if len(needle) == len(haystack) {
-		/* Since this method can only be called with a haystack which
-		 * matches needle. If the lengths of the strings are equal the
-		 * strings themselves must also be equal (ignoring case).
-		 */
-		for i, _ := range needle {
-			positions[i] = i
-		}
-		return MaxScore, nil
-	}
-
+func (m *matcher) MatchPositions() (Score, []int) {
 	/*
 	 * D[][] Stores the best score for this position ending with a match.
 	 * M[][] Stores the best possible score at this position.
 	 */
 	var (
-		D                              [][]Score = make([][]Score, len(needle))
-		M                              [][]Score = make([][]Score, len(needle))
+		positions                                = make([]int, len(m.needle))
+		D                              [][]Score = make([][]Score, len(m.needle))
+		M                              [][]Score = make([][]Score, len(m.needle))
 		last_D, last_M, curr_D, curr_M []Score
 	)
 
-	for i, _ := range haystack {
-		D[i] = make([]Score, len(haystack))
-		M[i] = make([]Score, len(haystack))
+	for i, _ := range m.haystack {
+		D[i] = make([]Score, len(m.haystack))
+		M[i] = make([]Score, len(m.haystack))
 	}
 
-	for i, r := range m.needleLower {
+	for i, r := range m.needle {
 		curr_D = D[i]
 		curr_M = M[i]
 
@@ -209,7 +169,7 @@ func MatchPositions(needle string, haystack string) (Score, []int) {
 
 	// Backtrack to find the positions of optimal matching
 	matchRequired := false
-	for i, j := len(needle)-1, len(haystack)-1; i >= 0; i-- {
+	for i, j := len(m.needle)-1, len(m.haystack)-1; i >= 0; i-- {
 		for ; j >= 0; j-- {
 			/*
 			 * There may be multiple paths which result in
@@ -235,5 +195,51 @@ func MatchPositions(needle string, haystack string) (Score, []int) {
 		}
 	}
 
-	return M[len(needle)-1][len(haystack)-1], positions
+	return M[len(m.needle)-1][len(m.haystack)-1], positions
+}
+
+func Match(needle string, haystack string) Score {
+	if needle == "" {
+		return MinScore
+	}
+
+	if len(needle) > len(haystack) {
+		/*
+		 * Unreasonably large candidate: return no score
+		 * If it is a valid match it will still be returned, it will
+		 * just be ranked below any reasonably sized candidates
+		 */
+		return MinScore
+	} else if len(needle) == len(haystack) {
+		/* Since this method can only be called with a haystack which
+		 * matches needle. If the lengths of the strings are equal the
+		 * strings themselves must also be equal (ignoring case).
+		 */
+		return MaxScore
+	}
+
+	return newMatcher(needle, haystack).Match()
+}
+
+func MatchPositions(needle string, haystack string) (Score, []int) {
+	if len(needle) > len(haystack) {
+		/*
+		 * Unreasonably large candidate: return no score
+		 * If it is a valid match it will still be returned, it will
+		 * just be ranked below any reasonably sized candidates
+		 */
+		return MinScore, nil
+	} else if len(needle) == len(haystack) {
+		/* Since this method can only be called with a haystack which
+		 * matches needle. If the lengths of the strings are equal the
+		 * strings themselves must also be equal (ignoring case).
+		 */
+		positions := make([]int, len(needle))
+		for i, _ := range needle {
+			positions[i] = i
+		}
+		return MaxScore, positions
+	}
+
+	return newMatcher(needle, haystack).MatchPositions()
 }
