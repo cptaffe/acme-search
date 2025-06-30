@@ -35,16 +35,7 @@ func (s *Search) Query() string {
 	return strings.TrimSpace(s.query[len(s.prompt):])
 }
 
-func search(ctx context.Context, query string, ch chan<- string) error {
-	defer close(ch)
-
-	// Debounce
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(200 * time.Millisecond):
-	}
-
+func commandSource(ctx context.Context, query string, ch chan<- *Result) error {
 	cmd := exec.CommandContext(ctx, "L", "sym", "-p", query)
 	r, err := cmd.StdoutPipe()
 	if err != nil {
@@ -57,10 +48,23 @@ func search(ctx context.Context, query string, ch chan<- string) error {
 	}
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
+		var res Result
+		parts := strings.SplitN(scanner.Text(), ":", 3)
+		switch len(parts) {
+		case 3:
+			res.Addr = parts[0] + ":" + parts[1]
+			res.Text = parts[2]
+		case 2:
+			res.Addr = parts[0]
+			res.Text = parts[1]
+		case 1:
+			res.Text = parts[0]
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case ch <- scanner.Text():
+		case ch <- &res:
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -69,6 +73,21 @@ func search(ctx context.Context, query string, ch chan<- string) error {
 	err = cmd.Wait()
 	if err != nil {
 		return fmt.Errorf("wait L sym: %w", err)
+	}
+	return nil
+}
+
+func indexSource(ctx context.Context, ch chan<- *Result) error {
+	windows, err := acme.Windows()
+	if err != nil {
+		return fmt.Errorf("windows: %w", err)
+	}
+	for _, win := range windows {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ch <- &Result{Text: win.Name}:
+		}
 	}
 	return nil
 }
@@ -98,21 +117,52 @@ func (h *ResultHeap) Pop() any {
 }
 
 func (s *Search) Search(ctx context.Context) {
-	ch := make(chan string)
+	// Wait 100ms before we start
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	ch := make(chan *Result)
 	query := s.Query()
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		err := search(ctx, query, ch)
+		defer wg.Done()
+		err := commandSource(ctx, query, ch)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("search: %v", err)
 		}
 	}()
 	go func() {
+		defer wg.Done()
+		err := indexSource(ctx, ch)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("search: %v", err)
+		}
+	}()
+	// Close channel only when all writers are finished
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+	go func() {
 		var results ResultHeap
 		heap.Init(&results)
+		lastLen := results.Len()
+		// Wait 100ms before we render -- total 200ms delay
 		shouldRender := time.Now().Add(100 * time.Millisecond)
 
 		// Debounce render
 		render := func() error {
+			// Avoid re-rendering same results
+			currentLen := results.Len()
+			if currentLen == lastLen {
+				return nil
+			}
+			lastLen = currentLen
+
 			topN := make([]*Result, min(results.Len(), 20))
 			for i, _ := range topN {
 				topN[i] = heap.Pop(&results).(*Result)
@@ -141,29 +191,18 @@ func (s *Search) Search(ctx context.Context) {
 					return
 				}
 			case result := <-ch:
-				if result == "" {
+				if result == nil {
 					err := render()
 					if err != nil {
 						log.Printf("render: %v", err)
 					}
 					return
 				}
-				parts := strings.SplitN(result, ":", 3)
-				var res Result
-				switch len(parts) {
-				case 3:
-					res.Addr = parts[0] + ":" + parts[1]
-					res.Text = parts[2]
-				case 2:
-					res.Addr = parts[0]
-					res.Text = parts[1]
-				case 1:
-					res.Text = parts[0]
-				}
-				res.Score = fuzzy.Match(query, res.Text)
+
+				result.Score = fuzzy.Match(query, result.Text)
 				// Only show positive scores
-				if res.Score > 0 {
-					heap.Push(&results, &res)
+				if result.Score > 0 {
+					heap.Push(&results, result)
 				}
 			}
 		}
@@ -185,18 +224,17 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 	s.q0s = make([]int, len(results))
 	var sb strings.Builder
 
-	q0 := len(s.query)
 	// Fix query line newline, if deleted
 	if !strings.HasSuffix(s.query, "\n") {
 		s.query += "\n"
-		sb.WriteRune('\n')
 	}
+	sb.WriteString(s.query)
 
 	for i, result := range results {
-		s.q0s[i] = q0 + sb.Len() - 1
+		s.q0s[i] = sb.Len() - 1
 		fmt.Fprintf(&sb, "%f: %s\n", result.Score, result.Text)
 	}
-	err := s.win.Addr("#%d,$", q0)
+	err := s.win.Addr("0,$")
 	if err != nil {
 		return fmt.Errorf("addr: %w", err)
 	}
@@ -266,20 +304,24 @@ func (s *Search) delete(ctx context.Context, q0, q1 int) error {
 	return nil
 }
 
-func (s *Search) Plumb(q0 int) error {
+func (s *Search) Plumb(q0 int) (bool, error) {
 	// TODO: right clicking the very beginning of the first line fails to plumb
 	if len(s.q0s) == 0 || q0 < s.q0s[0] {
-		return nil
+		return false, nil
 	}
 
 	i, _ := slices.BinarySearch(s.q0s, q0)
+	addr := s.results[i-1].Addr
+	if addr == "" {
+		return false, nil
+	}
 
-	cmd := exec.Command("plumb", s.results[i-1].Addr)
+	cmd := exec.Command("plumb", addr)
 	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("plumb: %w", err)
+		return true, fmt.Errorf("plumb: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (s *Search) EventLoop(ctx context.Context) error {
@@ -299,9 +341,12 @@ func (s *Search) EventLoop(ctx context.Context) error {
 				s.win.WriteEvent(e)
 			case 'l', 'L': // look
 				if e.OrigQ0 > len(s.query) {
-					err := s.Plumb(e.OrigQ0)
+					ok, err := s.Plumb(e.OrigQ0)
 					if err != nil {
 						return err
+					}
+					if !ok {
+						s.win.WriteEvent(e)
 					}
 					break
 				}
@@ -350,6 +395,10 @@ func (s *Search) WritePrompt() error {
 	err = s.win.Ctl("dot=addr")
 	if err != nil {
 		return fmt.Errorf("dot=addr: %w", err)
+	}
+	err = s.win.Ctl("focus")
+	if err != nil {
+		return fmt.Errorf("focus: %w", err)
 	}
 	return err
 }
