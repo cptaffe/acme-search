@@ -210,12 +210,6 @@ func Match(needle string, haystack string) Score {
 		 * just be ranked below any reasonably sized candidates
 		 */
 		return MinScore
-	} else if len(needle) == len(haystack) {
-		/* Since this method can only be called with a haystack which
-		 * matches needle. If the lengths of the strings are equal the
-		 * strings themselves must also be equal (ignoring case).
-		 */
-		return MaxScore
 	}
 
 	return newMatcher(needle, haystack).Match()
@@ -229,16 +223,6 @@ func MatchPositions(needle string, haystack string) (Score, []int) {
 		 * just be ranked below any reasonably sized candidates
 		 */
 		return MinScore, nil
-	} else if len(needle) == len(haystack) {
-		/* Since this method can only be called with a haystack which
-		 * matches needle. If the lengths of the strings are equal the
-		 * strings themselves must also be equal (ignoring case).
-		 */
-		positions := make([]int, len(needle))
-		for i, _ := range needle {
-			positions[i] = i
-		}
-		return MaxScore, positions
 	}
 
 	return newMatcher(needle, haystack).MatchPositions()
