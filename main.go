@@ -32,7 +32,7 @@ type Search struct {
 }
 
 func (s *Search) Query() string {
-	return strings.TrimSpace(s.query[len(s.prompt):])
+	return strings.TrimSpace(strings.TrimPrefix(s.query, s.prompt))
 }
 
 func commandSource(ctx context.Context, query string, ch chan<- *Result) error {
@@ -103,6 +103,11 @@ type Result struct {
 	Score fuzzy.Score
 }
 
+func (r Result) Equals(o *Result) bool {
+	// Don't compare floats
+	return r.Text == o.Text && r.Addr == o.Addr
+}
+
 type ResultHeap []*Result
 
 func (h ResultHeap) Len() int           { return len(h) }
@@ -154,6 +159,7 @@ func (s *Search) Search(ctx context.Context) {
 	}()
 	go func() {
 		var results ResultHeap
+		hasRendered := false
 		heap.Init(&results)
 		lastLen := results.Len()
 		// Wait 100ms before we render -- total 200ms delay
@@ -161,17 +167,22 @@ func (s *Search) Search(ctx context.Context) {
 
 		// Debounce render
 		render := func() error {
-			// Avoid re-rendering same results
+			// Render at least once, avoid re-rendering same results
 			currentLen := results.Len()
-			if currentLen == lastLen {
+			if hasRendered && currentLen == lastLen {
+				hasRendered = true
 				return nil
 			}
-			lastLen = currentLen
 
-			topN := make([]*Result, min(results.Len(), 20))
-			for i, _ := range topN {
+			topN := make([]*Result, max(results.Len(), 20))
+			i := 0
+			for i < 20 && results.Len() > 0 {
 				topN[i] = heap.Pop(&results).(*Result)
+				if i == 0 || !topN[i-1].Equals(topN[i]) {
+					i++ // Only advance if not a duplicate
+				}
 			}
+			topN = topN[:i] // truncate unused slots
 			// TODO: Use btree to avoid mutation on read
 			for _, result := range topN {
 				heap.Push(&results, result)
@@ -182,6 +193,7 @@ func (s *Search) Search(ctx context.Context) {
 			}
 			// Reset timer
 			shouldRender = time.Now().Add(100 * time.Millisecond)
+			lastLen = results.Len() // may have changed
 			return nil
 		}
 
