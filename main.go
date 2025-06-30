@@ -170,9 +170,16 @@ func (s *Search) Search(ctx context.Context) {
 	}()
 }
 
-func (s *Search) writeResults(results []*Result) error {
+func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+
+	// If the context is canceled
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 
 	s.results = results
 	s.q0s = make([]int, len(results))
