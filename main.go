@@ -24,11 +24,15 @@ import (
 type Search struct {
 	lock    sync.Mutex
 	cancel  context.CancelFunc
-	q0      int
 	prompt  string
+	query   string
 	q0s     []int     // q0 of results
 	results []*Result // results
 	win     *acme.Win
+}
+
+func (s *Search) Query() string {
+	return strings.TrimSpace(s.query[len(s.prompt):])
 }
 
 func search(ctx context.Context, query string, ch chan<- string) error {
@@ -95,7 +99,7 @@ func (h *ResultHeap) Pop() any {
 
 func (s *Search) Search(ctx context.Context) {
 	ch := make(chan string)
-	query := s.prompt
+	query := s.Query()
 	go func() {
 		err := search(ctx, query, ch)
 		if err != nil && !errors.Is(err, context.Canceled) {
@@ -109,10 +113,9 @@ func (s *Search) Search(ctx context.Context) {
 
 		// Debounce render
 		render := func() error {
-			window := min(results.Len(), 20)
-			topN := make([]*Result, window)
-			for i := range window {
-				topN[(window-1)-i] = heap.Pop(&results).(*Result)
+			topN := make([]*Result, min(results.Len(), 20))
+			for i, _ := range topN {
+				topN[i] = heap.Pop(&results).(*Result)
 			}
 			err := s.writeResults(topN)
 			if err != nil {
@@ -170,32 +173,53 @@ func (s *Search) writeResults(results []*Result) error {
 	s.results = results
 	s.q0s = make([]int, len(results))
 	var sb strings.Builder
+
+	q0 := len(s.query)
+	// Fix query line newline, if deleted
+	if !strings.HasSuffix(s.query, "\n") {
+		s.query += "\n"
+		sb.WriteRune('\n')
+	}
+
 	for i, result := range results {
-		s.q0s[i] = sb.Len()
+		s.q0s[i] = q0 + sb.Len() - 1
 		fmt.Fprintf(&sb, "%f: %s\n", result.Score, result.Text)
 	}
-	err := s.win.Addr("#%d,#%d", 0, s.q0-2)
+	err := s.win.Addr("#%d,$", q0)
 	if err != nil {
-		return fmt.Errorf("addr: %w")
+		return fmt.Errorf("addr: %w", err)
 	}
 	_, err = s.win.Write("data", []byte(sb.String()))
 	if err != nil {
-		return fmt.Errorf("write: %w")
+		return fmt.Errorf("write: %w", err)
 	}
-	s.q0 = 2 + sb.Len()
+	// Place the cursor back at the end of the prompt line
+	err = s.win.Addr("#%d", len(s.query)-1)
+	if err != nil {
+		return fmt.Errorf("addr: %w", err)
+	}
+	err = s.win.Ctl("dot=addr")
+	if err != nil {
+		return fmt.Errorf("dot=addr: %v", err)
+	}
+	// Scroll the prompt line into view
+	err = s.win.Ctl("show")
+	if err != nil {
+		return fmt.Errorf("show: %w", err)
+	}
 	return nil
 }
 
 func (s *Search) insert(ctx context.Context, q0, q1 int, text string) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	// If an edit occurs earlier in the document, update the prompt line position
-	if q0 < s.q0 {
-		s.q0 += q1 - q0
+	// If an edit occurs after the query line
+	if q0 > len(s.query) {
+		// TODO: Update s.q0s
 		return nil
 	}
-	// Insert within prompt line
-	s.prompt = s.prompt[:q0-s.q0] + text + s.prompt[q0-s.q0:]
+	// Insert within query line
+	s.query = s.query[:q0] + text + s.query[q0:]
 
 	if s.cancel != nil {
 		s.cancel() // Cancel previous search
@@ -209,24 +233,18 @@ func (s *Search) insert(ctx context.Context, q0, q1 int, text string) error {
 func (s *Search) delete(ctx context.Context, q0, q1 int) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	// Deletion which ends before the prompt
-	if q0 < s.q0 {
-		s.q0 -= q1 - q0
+	// Deletion which starts after the query line
+	if q0 > len(s.query) {
+		// TODO: Update s.q0s
 		return nil
 	}
-	// Deletion which includes the prompt
-	if q1 < s.q0 {
-		// Distance between beginning of delete and beginning of prompt
-		diff := s.q0 - q0
-		// Prompt now starts at beginning of deletion
-		s.q0 -= diff
-		// Update delete to start at beginning of prompt
-		q0 = s.q0
-		// Adjust end to account for movement of prompt
-		q1 -= diff
+	if q1 > len(s.query) {
+		// Update delete to end at end of query
+		q1 = len(s.query)
 	}
-	// Delete within prompt line
-	s.prompt = s.prompt[:q0-s.q0] + s.prompt[q1-s.q0:]
+
+	// Delete within query line
+	s.query = s.query[:q0] + s.query[q1:]
 
 	if s.cancel != nil {
 		s.cancel() // Cancel previous search
@@ -238,8 +256,10 @@ func (s *Search) delete(ctx context.Context, q0, q1 int) error {
 }
 
 func (s *Search) Plumb(q0 int) error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	// TODO: right clicking the very beginning of the first line fails to plumb
+	if len(s.q0s) == 0 || q0 < s.q0s[0] {
+		return nil
+	}
 
 	i, _ := slices.BinarySearch(s.q0s, q0)
 
@@ -267,7 +287,7 @@ func (s *Search) EventLoop(ctx context.Context) error {
 			case 'x', 'X':
 				s.win.WriteEvent(e)
 			case 'l', 'L': // look
-				if e.OrigQ0 < s.q0 {
+				if e.OrigQ0 > len(s.query) {
 					err := s.Plumb(e.OrigQ0)
 					if err != nil {
 						return err
@@ -301,6 +321,28 @@ func (s *Search) EventLoop(ctx context.Context) error {
 	}
 }
 
+func (s *Search) WritePrompt() error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	line := fmt.Sprintf("%s\n", s.prompt)
+	s.query = line
+	_, err := s.win.Write("body", []byte(line))
+	if err != nil {
+		fmt.Errorf("write: %w", err)
+	}
+	s.query = line
+	err = s.win.Addr("#2")
+	if err != nil {
+		fmt.Errorf("addr: %w", err)
+	}
+	err = s.win.Ctl("dot=addr")
+	if err != nil {
+		return fmt.Errorf("dot=addr: %w", err)
+	}
+	return err
+}
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -324,11 +366,10 @@ func main() {
 		return
 	}
 
-	s := &Search{q0: 2, prompt: "", win: win}
-
-	_, err = win.Write("body", []byte{'>', ' '})
+	s := &Search{prompt: "> ", win: win}
+	s.WritePrompt()
 	if err != nil {
-		log.Printf("new acme win: %v", err)
+		log.Printf("write prompt: %v", err)
 		return
 	}
 
