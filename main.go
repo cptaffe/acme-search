@@ -117,7 +117,11 @@ func (s *Search) Search(ctx context.Context) {
 			for i, _ := range topN {
 				topN[i] = heap.Pop(&results).(*Result)
 			}
-			err := s.writeResults(topN)
+			// TODO: Use btree to avoid mutation on read
+			for _, result := range topN {
+				heap.Push(&results, result)
+			}
+			err := s.writeResults(ctx, topN)
 			if err != nil {
 				return fmt.Errorf("write line: %w", err)
 			}
