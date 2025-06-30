@@ -31,12 +31,23 @@ type Search struct {
 	win     *acme.Win
 }
 
-func (s *Search) Query() string {
-	return strings.TrimSpace(strings.TrimPrefix(s.query, s.prompt))
+const DefaultFlags = "sw" // symbols and windows
+
+// Flags can enable additional functionality
+func (s *Search) Flags() string {
+	parts := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(s.query, s.prompt)), "+", 2)
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	return DefaultFlags
 }
 
-func commandSource(ctx context.Context, query string, ch chan<- *Result) error {
-	cmd := exec.CommandContext(ctx, "L", "sym", "-p", query)
+func (s *Search) Query() string {
+	return strings.SplitN(strings.TrimSpace(strings.TrimPrefix(s.query, s.prompt)), "+", 2)[0]
+}
+
+func commandSource(ctx context.Context, command []string, ch chan<- *Result) error {
+	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
 	r, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -49,8 +60,11 @@ func commandSource(ctx context.Context, query string, ch chan<- *Result) error {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		var res Result
-		parts := strings.SplitN(scanner.Text(), ":", 3)
+		parts := strings.SplitN(scanner.Text(), ":", 4)
 		switch len(parts) {
+		case 4:
+			res.Addr = parts[0] + ":" + parts[1] + ":" + parts[2]
+			res.Text = parts[3]
 		case 3:
 			res.Addr = parts[0] + ":" + parts[1]
 			res.Text = parts[2]
@@ -76,7 +90,7 @@ func commandSource(ctx context.Context, query string, ch chan<- *Result) error {
 		case <-ctx.Done():
 			return ctx.Err() // likely `signal: killed` caused by cancelation
 		default:
-			return fmt.Errorf("wait L sym: %w", err)
+			return fmt.Errorf("wait: %w", err)
 		}
 	}
 	return nil
@@ -136,22 +150,40 @@ func (s *Search) Search(ctx context.Context) {
 
 	ch := make(chan *Result)
 	query := s.Query()
+	flags := s.Flags()
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		err := commandSource(ctx, query, ch)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("search: %v", err)
+	for _, flag := range flags {
+		wg.Add(1)
+		switch flag {
+		case 's': // symbols
+			go func() {
+				defer wg.Done()
+				err := commandSource(ctx, []string{"L", "sym", "-p", query}, ch)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("L sym: %v", err)
+				}
+			}()
+		case 'w': // windows
+			go func() {
+				defer wg.Done()
+				err := indexSource(ctx, ch)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("windows: %v", err)
+				}
+			}()
+		case 'g': // regexp
+			go func() {
+				defer wg.Done()
+				err := commandSource(ctx, []string{"rg", query}, ch)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("ripgrep: %v", err)
+				}
+			}()
+		default:
+			wg.Done()
+			log.Printf("unknown flag: %c", flag)
 		}
-	}()
-	go func() {
-		defer wg.Done()
-		err := indexSource(ctx, ch)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("search: %v", err)
-		}
-	}()
+	}
 	// Close channel only when all writers are finished
 	go func() {
 		wg.Wait()
