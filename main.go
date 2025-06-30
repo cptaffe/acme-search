@@ -72,7 +72,7 @@ func search(ctx context.Context, query string, ch chan<- string) error {
 type Result struct {
 	Text  string
 	Addr  string
-	Score int
+	Score fuzzy.Score
 }
 
 type ResultHeap []*Result
@@ -108,26 +108,19 @@ func (s *Search) Search(ctx context.Context) {
 		shouldRender := time.Now().Add(100 * time.Millisecond)
 
 		// Debounce render
-		render := func() {
-			err := s.clear()
-			if err != nil {
-				log.Printf("clear: %v", err)
-			}
+		render := func() error {
 			window := min(results.Len(), 20)
-			s.results = make([]*Result, window)
-			s.q0s = make([]int, window)
+			topN := make([]*Result, window)
 			for i := range window {
-				s.results[(window-1)-i] = heap.Pop(&results).(*Result)
+				topN[(window-1)-i] = heap.Pop(&results).(*Result)
 			}
-			for i, result := range s.results {
-				s.q0s[i] = s.q0 - 2
-				err := s.writeLine(fmt.Sprintf("%d: %s", result.Score, result.Text))
-				if err != nil {
-					log.Printf("write line: %v", err)
-				}
+			err := s.writeResults(topN)
+			if err != nil {
+				return fmt.Errorf("write line: %w", err)
 			}
 			// Reset timer
 			shouldRender = time.Now().Add(100 * time.Millisecond)
+			return nil
 		}
 
 		for {
@@ -135,48 +128,61 @@ func (s *Search) Search(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-time.After(time.Until(shouldRender)):
-				render()
+				err := render()
+				if err != nil {
+					log.Printf("render: %v", err)
+					return
+				}
 			case result := <-ch:
 				if result == "" {
-					render()
+					err := render()
+					if err != nil {
+						log.Printf("render: %v", err)
+					}
 					return
 				}
 				parts := strings.SplitN(result, ":", 3)
-
-				heap.Push(&results, &Result{Text: parts[2], Addr: parts[0] + ":" + parts[1], Score: fuzzy.ScoreFuzzy(query, parts[2], true)})
+				var res Result
+				switch len(parts) {
+				case 3:
+					res.Addr = parts[0] + ":" + parts[1]
+					res.Text = parts[2]
+				case 2:
+					res.Addr = parts[0]
+					res.Text = parts[1]
+				case 1:
+					res.Text = parts[0]
+				}
+				res.Score = fuzzy.Match(query, res.Text)
+				// Only show positive scores
+				if res.Score > 0 {
+					heap.Push(&results, &res)
+				}
 			}
 		}
 	}()
 }
 
-func (s *Search) writeLine(line string) error {
+func (s *Search) writeResults(results []*Result) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	err := s.win.Addr("#%d", s.q0-2) // write before prompt line
-	if err != nil {
-		return fmt.Errorf("addr: %w")
-	}
-	line += "\n"
-	s.q0 += len(line)
-	_, err = s.win.Write("data", []byte(line))
-	if err != nil {
-		return fmt.Errorf("write: %w")
-	}
-	return nil
-}
 
-func (s *Search) clear() error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.results = results
+	s.q0s = make([]int, len(results))
+	var sb strings.Builder
+	for i, result := range results {
+		s.q0s[i] = sb.Len()
+		fmt.Fprintf(&sb, "%f: %s\n", result.Score, result.Text)
+	}
 	err := s.win.Addr("#%d,#%d", 0, s.q0-2)
 	if err != nil {
 		return fmt.Errorf("addr: %w")
 	}
-	s.q0 = 2
-	_, err = s.win.Write("data", []byte{})
+	_, err = s.win.Write("data", []byte(sb.String()))
 	if err != nil {
 		return fmt.Errorf("write: %w")
 	}
+	s.q0 = 2 + sb.Len()
 	return nil
 }
 
