@@ -1,3 +1,7 @@
+// TODO: Mark clean when all results are in
+// TODO: Replace cursor where it was, not at end of query -- truncate to query bounds
+// TODO: Update working directory of sourceCommand based on window name changes
+// TODO: Group lines within the same file
 package main
 
 import (
@@ -57,19 +61,20 @@ func commandSource(ctx context.Context, command []string, ch chan<- *Result) err
 	if err != nil {
 		return fmt.Errorf("start L sym: %w", err)
 	}
+	// TODO: Allow lines longer than 64k, use regexp.MatchReader with regexp incorporating : prefix grammar and max lengths, then consume up to newline or EOF.
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		var res Result
 		parts := strings.SplitN(scanner.Text(), ":", 4)
 		switch len(parts) {
 		case 4:
-			res.Addr = parts[0] + ":" + parts[1] + ":" + parts[2]
+			res.Addr = Addr{File: parts[0], Line: parts[1], Column: parts[2]}
 			res.Text = parts[3]
 		case 3:
-			res.Addr = parts[0] + ":" + parts[1]
+			res.Addr = Addr{File: parts[0], Line: parts[1]}
 			res.Text = parts[2]
 		case 2:
-			res.Addr = parts[0]
+			res.Addr = Addr{File: parts[0]}
 			res.Text = parts[1]
 		case 1:
 			res.Text = parts[0]
@@ -111,15 +116,36 @@ func indexSource(ctx context.Context, ch chan<- *Result) error {
 	return nil
 }
 
+type Addr struct {
+	File   string
+	Line   string
+	Column string
+}
+
+func (a Addr) String() string {
+	s := a.File
+	if a.Line != "" {
+		s += ":" + a.Line
+		if a.Column != "" {
+			s += ":" + a.Column
+		}
+	}
+	return s
+}
+
 type Result struct {
 	Text  string
-	Addr  string
+	Addr  Addr
 	Score fuzzy.Score
 }
 
 func (r Result) Equals(o *Result) bool {
 	// Don't compare floats
 	return r.Text == o.Text && r.Addr == o.Addr
+}
+
+func (r Result) String() string {
+	return fmt.Sprintf("%s\n%s\n", r.Addr, r.Text)
 }
 
 type ResultHeap []*Result
@@ -202,9 +228,9 @@ func (s *Search) Search(ctx context.Context) {
 			// Render at least once, avoid re-rendering same results
 			currentLen := results.Len()
 			if hasRendered && currentLen == lastLen {
-				hasRendered = true
 				return nil
 			}
+			hasRendered = true
 
 			topN := make([]*Result, max(results.Len(), 20))
 			i := 0
@@ -223,6 +249,7 @@ func (s *Search) Search(ctx context.Context) {
 			if err != nil {
 				return fmt.Errorf("write line: %w", err)
 			}
+
 			// Reset timer
 			shouldRender = time.Now().Add(100 * time.Millisecond)
 			lastLen = results.Len() // may have changed
@@ -239,8 +266,8 @@ func (s *Search) Search(ctx context.Context) {
 					log.Printf("render: %v", err)
 					return
 				}
-			case result := <-ch:
-				if result == nil {
+			case result, ok := <-ch:
+				if !ok {
 					err := render()
 					if err != nil {
 						log.Printf("render: %v", err)
@@ -269,7 +296,7 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 	default:
 	}
 
-	s.results = results
+	s.results = make([]*Result, len(results))
 	s.q0s = make([]int, len(results))
 	var sb strings.Builder
 
@@ -279,9 +306,29 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 	}
 	sb.WriteString(s.query)
 
-	for i, result := range results {
-		s.q0s[i] = sb.Len() - 1
-		fmt.Fprintf(&sb, "%f: %s\n", result.Score, result.Text)
+	var files []string
+	lines := make(map[string][]*Result)
+	for _, result := range results {
+		file := result.Addr.File
+		if !slices.Contains(files, file) {
+			files = append(files, file)
+		}
+		lines[file] = append(lines[file], result)
+	}
+
+	i := 0
+	for _, file := range files {
+		fmt.Fprintf(&sb, "%s\n", file)
+		for _, result := range lines[file] {
+			s.results[i] = result // place in updated order
+			s.q0s[i] = sb.Len() - 1
+			addr := result.Addr
+			if addr.Line != "" {
+				fmt.Fprintf(&sb, "%-5s ", addr.Line)
+			}
+			fmt.Fprintf(&sb, "%s\n", result.Text)
+			i++
+		}
 	}
 	err := s.win.Addr("0,$")
 	if err != nil {
@@ -361,11 +408,11 @@ func (s *Search) Plumb(q0 int) (bool, error) {
 
 	i, _ := slices.BinarySearch(s.q0s, q0)
 	addr := s.results[i-1].Addr
-	if addr == "" {
+	if addr.File == "" {
 		return false, nil
 	}
 
-	cmd := exec.Command("plumb", addr)
+	cmd := exec.Command("plumb", addr.String())
 	err := cmd.Run()
 	if err != nil {
 		return true, fmt.Errorf("plumb: %w", err)
