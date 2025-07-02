@@ -1,7 +1,8 @@
 // TODO: Mark clean when all results are in
 // TODO: Replace cursor where it was, not at end of query -- truncate to query bounds
 // TODO: Update working directory of sourceCommand based on window name changes
-// TODO: Group lines within the same file
+// TODO: Look on file name should not redirect to last symbol of previous file (need q0 for file lines)
+// TODO: Tree mode: display results like tree, grouped by shared parent -- great with +f for find mode (match on file name, not contents)
 package main
 
 import (
@@ -14,6 +15,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -35,13 +38,26 @@ type Search struct {
 	win     *acme.Win
 }
 
-const DefaultFlags = "sw" // symbols and windows
+type Flag rune
+
+const (
+	FlagSymbols Flag = 's' // Search symbols known to any language servers
+	FlagWindows Flag = 'w' // Search open windows by name
+	FlagGrep    Flag = 'g' // Search contents of files recursively using rg, see also: plan9port/bin/g
+	FlagFiles   Flag = 'f' // Search files recursively by name
+)
+
+var DefaultFlags []Flag = []Flag{FlagSymbols, FlagWindows} // symbols and windows
 
 // Flags can enable additional functionality
-func (s *Search) Flags() string {
+func (s *Search) Flags() []Flag {
 	parts := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(s.query, s.prompt)), "+", 2)
 	if len(parts) == 2 {
-		return parts[1]
+		flags := make([]Flag, len(parts[1]))
+		for i, r := range parts[1] {
+			flags[i] = Flag(r)
+		}
+		return flags
 	}
 	return DefaultFlags
 }
@@ -50,8 +66,12 @@ func (s *Search) Query() string {
 	return strings.SplitN(strings.TrimSpace(strings.TrimPrefix(s.query, s.prompt)), "+", 2)[0]
 }
 
+var twoColonRangeRegexp = regexp.MustCompile(`(.*):([0-9]+).([0-9]+)[:,]([0-9]+).([0-9]+)[: ](.*)`)
+var twoColonAddrRegexp = regexp.MustCompile(`(.*):([0-9]+)[:,]([0-9]+)[: ](.*)`)
+
 func commandSource(ctx context.Context, command []string, ch chan<- *Result) error {
 	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	cmd.Stderr = os.Stderr
 	r, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -61,23 +81,27 @@ func commandSource(ctx context.Context, command []string, ch chan<- *Result) err
 	if err != nil {
 		return fmt.Errorf("start L sym: %w", err)
 	}
+
 	// TODO: Allow lines longer than 64k, use regexp.MatchReader with regexp incorporating : prefix grammar and max lengths, then consume up to newline or EOF.
+
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
+		line := scanner.Text()
 		var res Result
-		parts := strings.SplitN(scanner.Text(), ":", 4)
-		switch len(parts) {
-		case 4:
-			res.Addr = Addr{File: parts[0], Line: parts[1], Column: parts[2]}
-			res.Text = parts[3]
-		case 3:
-			res.Addr = Addr{File: parts[0], Line: parts[1]}
-			res.Text = parts[2]
-		case 2:
-			res.Addr = Addr{File: parts[0]}
-			res.Text = parts[1]
-		case 1:
-			res.Text = parts[0]
+		if matches := twoColonRangeRegexp.FindStringSubmatch(line); matches != nil {
+			res.Addr.File = matches[1]
+			res.Addr.FromLine = matches[2]
+			res.Addr.FromColumn = matches[3]
+			res.Addr.ToLine = matches[4]
+			res.Addr.ToColumn = matches[5]
+			res.Text = matches[6]
+		} else if matches := twoColonAddrRegexp.FindStringSubmatch(line); matches != nil {
+			res.Addr.File = matches[1]
+			res.Addr.FromLine = matches[2]
+			res.Addr.FromColumn = matches[3]
+			res.Text = matches[4]
+		} else {
+			res.Text = line
 		}
 
 		select {
@@ -86,7 +110,8 @@ func commandSource(ctx context.Context, command []string, ch chan<- *Result) err
 		case ch <- &res:
 		}
 	}
-	if err := scanner.Err(); err != nil {
+	err = scanner.Err()
+	if err != nil {
 		return fmt.Errorf("scanning: %w", err)
 	}
 	err = cmd.Wait()
@@ -117,17 +142,25 @@ func indexSource(ctx context.Context, ch chan<- *Result) error {
 }
 
 type Addr struct {
-	File   string
-	Line   string
-	Column string
+	File       string
+	FromLine   string
+	FromColumn string
+	ToLine     string
+	ToColumn   string
 }
 
 func (a Addr) String() string {
 	s := a.File
-	if a.Line != "" {
-		s += ":" + a.Line
-		if a.Column != "" {
-			s += ":" + a.Column
+	if a.FromLine != "" {
+		s += ":" + a.FromLine
+		if a.FromColumn != "" {
+			s += "." + a.FromColumn
+		}
+		if a.ToLine != "" {
+			s += "," + a.ToLine
+			if a.ToColumn != "" {
+				s += "." + a.ToColumn
+			}
 		}
 	}
 	return s
@@ -174,6 +207,21 @@ func (s *Search) Search(ctx context.Context) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
+	// Use the search window's path as the search root
+	// TODO: Track changes here via Ki events
+	path := "."
+	data, err := s.win.ReadAll("tag")
+	if err != nil {
+		log.Printf("read tag: %v", err)
+		return
+	}
+	tag := string(data)
+	i := strings.Index(tag, " Del Snarf ")
+	if i == -1 {
+		log.Printf("cannot determine filename in tag %q", tag)
+	}
+	path = filepath.Dir(tag[:i])
+
 	ch := make(chan *Result)
 	query := s.Query()
 	flags := s.Flags()
@@ -181,7 +229,7 @@ func (s *Search) Search(ctx context.Context) {
 	for _, flag := range flags {
 		wg.Add(1)
 		switch flag {
-		case 's': // symbols
+		case FlagSymbols:
 			go func() {
 				defer wg.Done()
 				err := commandSource(ctx, []string{"L", "sym", "-p", query}, ch)
@@ -189,7 +237,7 @@ func (s *Search) Search(ctx context.Context) {
 					log.Printf("L sym: %v", err)
 				}
 			}()
-		case 'w': // windows
+		case FlagWindows:
 			go func() {
 				defer wg.Done()
 				err := indexSource(ctx, ch)
@@ -197,10 +245,18 @@ func (s *Search) Search(ctx context.Context) {
 					log.Printf("windows: %v", err)
 				}
 			}()
-		case 'g': // regexp
+		case FlagGrep:
 			go func() {
 				defer wg.Done()
-				err := commandSource(ctx, []string{"rg", query}, ch)
+				err := commandSource(ctx, []string{"rg", "--max-columns", "120", query, path}, ch)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("ripgrep: %v", err)
+				}
+			}()
+		case FlagFiles:
+			go func() {
+				defer wg.Done()
+				err := commandSource(ctx, []string{"rg", "--max-columns", "120", "--iglob", "*" + query + "*", "--files", path}, ch)
 				if err != nil && !errors.Is(err, context.Canceled) {
 					log.Printf("ripgrep: %v", err)
 				}
@@ -233,10 +289,16 @@ func (s *Search) Search(ctx context.Context) {
 			hasRendered = true
 
 			topN := make([]*Result, max(results.Len(), 20))
+			seen := make(map[Addr]struct{})
 			i := 0
 			for i < 20 && results.Len() > 0 {
-				topN[i] = heap.Pop(&results).(*Result)
-				if i == 0 || !topN[i-1].Equals(topN[i]) {
+				result := heap.Pop(&results).(*Result)
+				topN[i] = result
+				_, isDup := seen[result.Addr]
+				if !isDup {
+					seen[result.Addr] = struct{}{}
+				}
+				if i == 0 || !isDup {
 					i++ // Only advance if not a duplicate
 				}
 			}
@@ -323,8 +385,8 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 			s.results[i] = result // place in updated order
 			s.q0s[i] = sb.Len() - 1
 			addr := result.Addr
-			if addr.Line != "" {
-				fmt.Fprintf(&sb, "%-5s ", addr.Line)
+			if addr.FromLine != "" {
+				fmt.Fprintf(&sb, "%-5s ", addr.FromLine)
 			}
 			fmt.Fprintf(&sb, "%s\n", result.Text)
 			i++
