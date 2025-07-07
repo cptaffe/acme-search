@@ -89,16 +89,20 @@ func commandSource(ctx context.Context, command []string, ch chan<- *Result) err
 		line := scanner.Text()
 		var res Result
 		if matches := twoColonRangeRegexp.FindStringSubmatch(line); matches != nil {
-			res.Addr.File = matches[1]
-			res.Addr.FromLine = matches[2]
-			res.Addr.FromColumn = matches[3]
-			res.Addr.ToLine = matches[4]
-			res.Addr.ToColumn = matches[5]
+			res.Addr = &Addr{
+				File:       matches[1],
+				FromLine:   matches[2],
+				FromColumn: matches[3],
+				ToLine:     matches[4],
+				ToColumn:   matches[5],
+			}
 			res.Text = matches[6]
 		} else if matches := twoColonAddrRegexp.FindStringSubmatch(line); matches != nil {
-			res.Addr.File = matches[1]
-			res.Addr.FromLine = matches[2]
-			res.Addr.FromColumn = matches[3]
+			res.Addr = &Addr{
+				File:       matches[1],
+				FromLine:   matches[2],
+				FromColumn: matches[3],
+			}
 			res.Text = matches[4]
 		} else {
 			res.Text = line
@@ -168,13 +172,13 @@ func (a Addr) String() string {
 
 type Result struct {
 	Text  string
-	Addr  Addr
+	Addr  *Addr
 	Score fuzzy.Score
 }
 
 func (r Result) Equals(o *Result) bool {
 	// Don't compare floats
-	return r.Text == o.Text && r.Addr == o.Addr
+	return r.Text == o.Text && *r.Addr == *o.Addr
 }
 
 func (r Result) String() string {
@@ -289,17 +293,24 @@ func (s *Search) Search(ctx context.Context) {
 			hasRendered = true
 
 			topN := make([]*Result, max(results.Len(), 20))
-			seen := make(map[Addr]struct{})
+			seenAtAddr := make(map[Addr]struct{})
+			seenInFile := make(map[string]int)
 			i := 0
 			for i < 20 && results.Len() > 0 {
 				result := heap.Pop(&results).(*Result)
 				topN[i] = result
-				_, isDup := seen[result.Addr]
-				if !isDup {
-					seen[result.Addr] = struct{}{}
+				if result.Addr == nil {
+					i++
+					continue
 				}
-				if i == 0 || !isDup {
-					i++ // Only advance if not a duplicate
+				_, isDup := seenAtAddr[*result.Addr]
+				if !isDup {
+					seenAtAddr[*result.Addr] = struct{}{}
+				}
+				count := seenInFile[result.Addr.File]
+				seenInFile[result.Addr.File] = count + 1
+				if i == 0 || (count < 5 && !isDup) {
+					i++
 				}
 			}
 			topN = topN[:i] // truncate unused slots
@@ -347,6 +358,11 @@ func (s *Search) Search(ctx context.Context) {
 	}()
 }
 
+type Group struct {
+	Name    string // optional name for group
+	Results []*Result
+}
+
 func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -356,6 +372,16 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
+	}
+
+	// Get current cursor position
+	err := s.win.Ctl("addr=dot")
+	if err != nil {
+		return fmt.Errorf("addr=dot: %w", err)
+	}
+	q0, q1, err := s.win.ReadAddr()
+	if err != nil {
+		return fmt.Errorf("read addr: %w", err)
 	}
 
 	s.results = make([]*Result, len(results))
@@ -368,31 +394,40 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 	}
 	sb.WriteString(s.query)
 
-	var files []string
-	lines := make(map[string][]*Result)
+	// TODO: not all results have files
+	var groups []Group
 	for _, result := range results {
-		file := result.Addr.File
-		if !slices.Contains(files, file) {
-			files = append(files, file)
+		if result.Addr == nil {
+			groups = append(groups, Group{Results: []*Result{result}})
+			continue
 		}
-		lines[file] = append(lines[file], result)
+		file := result.Addr.File
+		for _, group := range groups {
+			if group.Name == file {
+				group.Results = append(group.Results, result)
+				continue
+			}
+		}
+		groups = append(groups, Group{Name: file, Results: []*Result{result}})
 	}
 
 	i := 0
-	for _, file := range files {
-		fmt.Fprintf(&sb, "%s\n", file)
-		for _, result := range lines[file] {
+	for _, group := range groups {
+		if group.Name != "" {
+			fmt.Fprintf(&sb, "%s\n", group.Name)
+		}
+		for _, result := range group.Results {
 			s.results[i] = result // place in updated order
 			s.q0s[i] = sb.Len() - 1
 			addr := result.Addr
-			if addr.FromLine != "" {
+			if addr != nil && addr.FromLine != "" {
 				fmt.Fprintf(&sb, "%-5s ", addr.FromLine)
 			}
 			fmt.Fprintf(&sb, "%s\n", result.Text)
 			i++
 		}
 	}
-	err := s.win.Addr("0,$")
+	err = s.win.Addr("0,$")
 	if err != nil {
 		return fmt.Errorf("addr: %w", err)
 	}
@@ -401,7 +436,7 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 		return fmt.Errorf("write: %w", err)
 	}
 	// Place the cursor back at the end of the prompt line
-	err = s.win.Addr("#%d", len(s.query)-1)
+	err = s.win.Addr("#%d,#%d", min(q0, len(s.query)-1), min(q1, len(s.query)-1))
 	if err != nil {
 		return fmt.Errorf("addr: %w", err)
 	}
@@ -470,7 +505,7 @@ func (s *Search) Plumb(q0 int) (bool, error) {
 
 	i, _ := slices.BinarySearch(s.q0s, q0)
 	addr := s.results[i-1].Addr
-	if addr.File == "" {
+	if addr == nil {
 		return false, nil
 	}
 
