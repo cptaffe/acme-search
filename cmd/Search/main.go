@@ -46,7 +46,7 @@ const (
 	FlagGrep    Flag = 'g' // Search contents of files recursively using rg, see also: plan9port/bin/g
 	FlagFiles   Flag = 'f' // Search files recursively by name
 
-	MaxLineLength    string        = "1024"
+	MaxLineLength    string        = "2048"
 	MaxResults       int           = 100
 	DebounceDuration time.Duration = 100 * time.Millisecond
 )
@@ -357,7 +357,10 @@ func (s *Search) Search(ctx context.Context) {
 				}
 
 				result.Score = fuzzy.Match(query, result.Text)
-				heap.Push(&results, result)
+				// Only show positive scores
+				if result.Score > 0 {
+					heap.Push(&results, result)
+				}
 			}
 		}
 	}()
