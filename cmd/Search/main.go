@@ -51,7 +51,7 @@ const (
 	DebounceDuration time.Duration = 100 * time.Millisecond
 )
 
-var DefaultFlags []Flag = []Flag{FlagSymbols, FlagWindows} // symbols and windows
+var DefaultFlags []Flag = []Flag{FlagSymbols, FlagWindows, FlagGrep}
 
 // Flags can enable additional functionality
 func (s *Search) Flags() []Flag {
