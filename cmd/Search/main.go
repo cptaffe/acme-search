@@ -45,6 +45,10 @@ const (
 	FlagWindows Flag = 'w' // Search open windows by name
 	FlagGrep    Flag = 'g' // Search contents of files recursively using rg, see also: plan9port/bin/g
 	FlagFiles   Flag = 'f' // Search files recursively by name
+
+	MaxLineLength    string        = "1024"
+	MaxResults       int           = 100
+	DebounceDuration time.Duration = 100 * time.Millisecond
 )
 
 var DefaultFlags []Flag = []Flag{FlagSymbols, FlagWindows} // symbols and windows
@@ -79,7 +83,7 @@ func commandSource(ctx context.Context, command []string, ch chan<- *Result) err
 	defer r.Close()
 	err = cmd.Start()
 	if err != nil {
-		return fmt.Errorf("start L sym: %w", err)
+		return fmt.Errorf("start command: %w", err)
 	}
 
 	// TODO: Allow lines longer than 64k, use regexp.MatchReader with regexp incorporating : prefix grammar and max lengths, then consume up to newline or EOF.
@@ -124,6 +128,10 @@ func commandSource(ctx context.Context, command []string, ch chan<- *Result) err
 		case <-ctx.Done():
 			return ctx.Err() // likely `signal: killed` caused by cancelation
 		default:
+			// e.g. 'exit status 1', representing no results found
+			if _, ok := err.(*exec.ExitError); ok {
+				return nil // swallow
+			}
 			return fmt.Errorf("wait: %w", err)
 		}
 	}
@@ -204,11 +212,11 @@ func (h *ResultHeap) Pop() any {
 }
 
 func (s *Search) Search(ctx context.Context) {
-	// Wait 100ms before we start
+	// Wait duration before we start
 	select {
 	case <-ctx.Done():
 		return
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(DebounceDuration):
 	}
 
 	// Use the search window's path as the search root
@@ -252,7 +260,7 @@ func (s *Search) Search(ctx context.Context) {
 		case FlagGrep:
 			go func() {
 				defer wg.Done()
-				err := commandSource(ctx, []string{"rg", "--max-columns", "120", query, path}, ch)
+				err := commandSource(ctx, []string{"rg", "--max-columns", MaxLineLength, query, path}, ch)
 				if err != nil && !errors.Is(err, context.Canceled) {
 					log.Printf("ripgrep: %v", err)
 				}
@@ -260,7 +268,7 @@ func (s *Search) Search(ctx context.Context) {
 		case FlagFiles:
 			go func() {
 				defer wg.Done()
-				err := commandSource(ctx, []string{"rg", "--max-columns", "120", "--iglob", "*" + query + "*", "--files", path}, ch)
+				err := commandSource(ctx, []string{"rg", "--max-columns", MaxLineLength, "--iglob", "*" + query + "*", "--files", path}, ch)
 				if err != nil && !errors.Is(err, context.Canceled) {
 					log.Printf("ripgrep: %v", err)
 				}
@@ -280,8 +288,8 @@ func (s *Search) Search(ctx context.Context) {
 		hasRendered := false
 		heap.Init(&results)
 		lastLen := results.Len()
-		// Wait 100ms before we render -- total 200ms delay
-		shouldRender := time.Now().Add(100 * time.Millisecond)
+		// Wait duration before we render -- total 2*duration delay
+		shouldRender := time.Now().Add(DebounceDuration)
 
 		// Debounce render
 		render := func() error {
@@ -292,11 +300,11 @@ func (s *Search) Search(ctx context.Context) {
 			}
 			hasRendered = true
 
-			topN := make([]*Result, max(results.Len(), 20))
+			topN := make([]*Result, max(results.Len(), MaxResults))
 			seenAtAddr := make(map[Addr]struct{})
 			seenInFile := make(map[string]int)
 			i := 0
-			for i < 20 && results.Len() > 0 {
+			for i < MaxResults && results.Len() > 0 {
 				result := heap.Pop(&results).(*Result)
 				topN[i] = result
 				if result.Addr == nil {
@@ -324,7 +332,7 @@ func (s *Search) Search(ctx context.Context) {
 			}
 
 			// Reset timer
-			shouldRender = time.Now().Add(100 * time.Millisecond)
+			shouldRender = time.Now().Add(DebounceDuration)
 			lastLen = results.Len() // may have changed
 			return nil
 		}
@@ -349,10 +357,7 @@ func (s *Search) Search(ctx context.Context) {
 				}
 
 				result.Score = fuzzy.Match(query, result.Text)
-				// Only show positive scores
-				if result.Score > 0 {
-					heap.Push(&results, result)
-				}
+				heap.Push(&results, result)
 			}
 		}
 	}()
