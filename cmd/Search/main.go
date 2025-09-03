@@ -6,6 +6,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"container/heap"
 	"context"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -418,20 +420,29 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 	sb.WriteString(s.query)
 
 	// TODO: not all results have files
-	var groups []Group
+	var groups []*Group
 	for _, result := range results {
 		if result.Addr == nil {
-			groups = append(groups, Group{Results: []*Result{result}})
+			groups = append(groups, &Group{Results: []*Result{result}})
 			continue
 		}
 		file := result.Addr.File
 		for _, group := range groups {
 			if group.Name == file {
-				group.Results = append(group.Results, result)
-				continue
+				i, _ := slices.BinarySearchFunc(group.Results, result, func(a *Result, b *Result) int {
+					if a.Addr == nil || b.Addr == nil || a.Addr.FromLine == "" || b.Addr.FromLine == "" {
+						return cmp.Compare(b.Score, a.Score) // higher scores at top
+					}
+					i, _ := strconv.Atoi(a.Addr.FromLine)
+					j, _ := strconv.Atoi(b.Addr.FromLine)
+					return cmp.Compare(i, j) // lower line numbers at top
+				})
+				group.Results = slices.Insert(group.Results, i, result)
+				goto L
 			}
 		}
-		groups = append(groups, Group{Name: file, Results: []*Result{result}})
+		groups = append(groups, &Group{Name: file, Results: []*Result{result}})
+	L:
 	}
 
 	i := 0
