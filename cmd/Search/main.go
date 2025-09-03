@@ -1,5 +1,4 @@
 // TODO: Mark clean when all results are in
-// TODO: Replace cursor where it was, not at end of query -- truncate to query bounds
 // TODO: Update working directory of sourceCommand based on window name changes
 // TODO: Look on file name should not redirect to last symbol of previous file (need q0 for file lines)
 // TODO: Tree mode: display results like tree, grouped by shared parent -- great with +f for find mode (match on file name, not contents)
@@ -28,12 +27,28 @@ import (
 	"github.com/cptaffe/acme-search/fuzzy"
 )
 
+// Range represents a half-open range [start, end)
+type Range struct {
+	Start int
+	End   int
+}
+
+func (r Range) Compare(i int) int {
+	if i < r.Start {
+		return 1 // before
+	}
+	if i >= r.End {
+		return -1 // after
+	}
+	return 0 // within
+}
+
 type Search struct {
 	lock    sync.Mutex
 	cancel  context.CancelFunc
 	prompt  string
 	query   string
-	q0s     []int     // q0 of results
+	ranges  []Range   // ranges of results
 	results []*Result // results
 	win     *acme.Win
 }
@@ -393,7 +408,7 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 	}
 
 	s.results = make([]*Result, len(results))
-	s.q0s = make([]int, len(results))
+	s.ranges = make([]Range, len(results))
 	var sb strings.Builder
 
 	// Fix query line newline, if deleted
@@ -426,12 +441,13 @@ func (s *Search) writeResults(ctx context.Context, results []*Result) error {
 		}
 		for _, result := range group.Results {
 			s.results[i] = result // place in updated order
-			s.q0s[i] = sb.Len() - 1
+			start := sb.Len() - 1
 			addr := result.Addr
 			if addr != nil && addr.FromLine != "" {
 				fmt.Fprintf(&sb, "%-5s ", addr.FromLine)
 			}
 			fmt.Fprintf(&sb, "%s\n", result.Text)
+			s.ranges[i] = Range{start, sb.Len() - 1}
 			i++
 		}
 	}
@@ -465,7 +481,7 @@ func (s *Search) insert(ctx context.Context, q0, q1 int, text string) error {
 	defer s.lock.Unlock()
 	// If an edit occurs after the query line
 	if q0 > len(s.query) {
-		// TODO: Update s.q0s
+		// TODO: Update s.ranges
 		return nil
 	}
 	// Insert within query line
@@ -485,7 +501,7 @@ func (s *Search) delete(ctx context.Context, q0, q1 int) error {
 	defer s.lock.Unlock()
 	// Deletion which starts after the query line
 	if q0 > len(s.query) {
-		// TODO: Update s.q0s
+		// TODO: Update s.ranges
 		return nil
 	}
 	if q1 > len(s.query) {
@@ -507,12 +523,16 @@ func (s *Search) delete(ctx context.Context, q0, q1 int) error {
 
 func (s *Search) Plumb(q0 int) (bool, error) {
 	// TODO: right clicking the very beginning of the first line fails to plumb
-	if len(s.q0s) == 0 || q0 < s.q0s[0] {
+	if len(s.ranges) == 0 || q0 < s.ranges[0].Start {
 		return false, nil
 	}
 
-	i, _ := slices.BinarySearch(s.q0s, q0)
-	addr := s.results[i-1].Addr
+	i, found := slices.BinarySearchFunc(s.ranges, q0, func(r Range, q0 int) int { return r.Compare(q0) })
+	if !found {
+		return false, nil
+	}
+
+	addr := s.results[i].Addr
 	if addr == nil {
 		return false, nil
 	}
