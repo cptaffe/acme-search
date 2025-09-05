@@ -373,6 +373,11 @@ func (s *Search) Search(ctx context.Context) {
 					return
 				}
 
+				// Rewrite path as relative
+				if result.Addr != nil {
+					result.Addr.File, _ = strings.CutPrefix(result.Addr.File, path+"/")
+				}
+
 				result.Score = fuzzy.Match(query, result.Text)
 				// Only show positive scores
 				if result.Score > 0 {
